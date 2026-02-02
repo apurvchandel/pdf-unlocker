@@ -16,25 +16,37 @@ def unlock_pdf():
     file = request.files['file']
     password = request.form.get('password', '')
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_in:
-        file.save(temp_in.name)
-        temp_in.flush()
-        reader = PdfReader(temp_in.name)
+    temp_in_name = None
+    temp_out_name = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_in:
+            temp_in_name = temp_in.name
+            file.save(temp_in.name)
+            temp_in.flush()
+            
+        reader = PdfReader(temp_in_name)
         if reader.is_encrypted:
             result = reader.decrypt(password)
             if result == 0:
-                os.unlink(temp_in.name)
                 return jsonify({'error': 'Wrong password or decryption failed'}), 400
+        
         writer = PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_out:
+            temp_out_name = temp_out.name
             writer.write(temp_out)
             temp_out.flush()
-            temp_out.seek(0)
-            response = send_file(temp_out.name, as_attachment=True, download_name='unlocked.pdf')
-        os.unlink(temp_in.name)
-        os.unlink(temp_out.name)
+        
+        return send_file(temp_out_name, as_attachment=True, download_name='unlocked.pdf')
+    except Exception as e:
+        return jsonify({'error': f'Error unlocking PDF: {str(e)}'}), 500
+    finally:
+        if temp_in_name and os.path.exists(temp_in_name):
+            os.unlink(temp_in_name)
+        if temp_out_name and os.path.exists(temp_out_name):
+            os.unlink(temp_out_name)
 
 @app.route('/add_pdf_password', methods=['POST'])
 def add_pdf_password():
@@ -46,13 +58,16 @@ def add_pdf_password():
     if not password:
         return jsonify({'error': 'Password is required'}), 400
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_in:
-        file.save(temp_in.name)
-        temp_in.flush()
+    temp_in_name = None
+    temp_out_name = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_in:
+            temp_in_name = temp_in.name
+            file.save(temp_in.name)
+            temp_in.flush()
 
-        reader = PdfReader(temp_in.name)
+        reader = PdfReader(temp_in_name)
         if reader.is_encrypted:
-            os.unlink(temp_in.name)
             return jsonify({'error': 'PDF is already encrypted. Unlock first if you want to change password.'}), 400
 
         writer = PdfWriter()
@@ -61,14 +76,18 @@ def add_pdf_password():
         writer.encrypt(password)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_out:
+            temp_out_name = temp_out.name
             writer.write(temp_out)
             temp_out.flush()
-            temp_out.seek(0)
-            response = send_file(temp_out.name, as_attachment=True, download_name='protected.pdf')
         
-        os.unlink(temp_in.name)
-        os.unlink(temp_out.name)
-        return response
+        return send_file(temp_out_name, as_attachment=True, download_name='protected.pdf')
+    except Exception as e:
+        return jsonify({'error': f'Error adding password to PDF: {str(e)}'}), 500
+    finally:
+        if temp_in_name and os.path.exists(temp_in_name):
+            os.unlink(temp_in_name)
+        if temp_out_name and os.path.exists(temp_out_name):
+            os.unlink(temp_out_name)
 
 
 
@@ -122,37 +141,91 @@ def compress_file():
 
     if file_extension in ['jpeg', 'jpg', 'png', 'gif']:
         try:
+            # Read the original file to get its size
+            file.stream.seek(0)
+            original_data = file.stream.read()
+            original_size = len(original_data)
+            file.stream.seek(0)
+            
             image = Image.open(file.stream)
             img_byte_arr = io.BytesIO()
             image.save(img_byte_arr, format='JPEG', quality=quality)
             img_byte_arr.seek(0)
-            return send_file(img_byte_arr, mimetype='image/jpeg', as_attachment=True, download_name=f'compressed_image.{file_extension}')
+            
+            # Get compressed size
+            compressed_size = len(img_byte_arr.getvalue())
+            
+            # Calculate compression ratio
+            compression_ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
+            
+            response = send_file(
+                img_byte_arr,
+                mimetype='image/jpeg',
+                as_attachment=True,
+                download_name=f'compressed_image.{file_extension}'
+            )
+            
+            # Add custom headers with file size information
+            response.headers['X-Original-Size'] = str(original_size)
+            response.headers['X-Compressed-Size'] = str(compressed_size)
+            response.headers['X-Compression-Ratio'] = f'{compression_ratio:.2f}'
+            
+            return response
         except Exception as e:
-            return jsonify({'error': f'Error compressing image: {e}'}), 500
+            return jsonify({'error': f'Error compressing image: {str(e)}'}), 500
     elif file_extension == 'pdf':
+        temp_in_name = None
+        temp_out_name = None
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_in:
+                temp_in_name = temp_in.name
                 file.save(temp_in.name)
                 temp_in.flush()
 
-            reader = PdfReader(temp_in.name)
+            # Get original file size
+            original_size = os.path.getsize(temp_in_name)
+
+            reader = PdfReader(temp_in_name)
             writer = PdfWriter()
             for page in reader.pages:
+                page.compress_content_streams()
                 writer.add_page(page)
-            
-            writer.compress_content_streams()
 
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_out:
+                temp_out_name = temp_out.name
                 writer.write(temp_out)
                 temp_out.flush()
-                temp_out.seek(0)
-                response = send_file(temp_out.name, as_attachment=True, download_name='compressed.pdf')
             
-            os.unlink(temp_in.name)
-            os.unlink(temp_out.name)
+            # Get compressed file size
+            compressed_size = os.path.getsize(temp_out_name)
+            
+            # Calculate compression ratio
+            compression_ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
+            
+            # Read the compressed file into memory to send with custom headers
+            with open(temp_out_name, 'rb') as f:
+                pdf_data = io.BytesIO(f.read())
+            
+            response = send_file(
+                pdf_data,
+                mimetype='application/pdf',
+                as_attachment=True,
+                download_name='compressed.pdf'
+            )
+            
+            # Add custom headers with file size information
+            response.headers['X-Original-Size'] = str(original_size)
+            response.headers['X-Compressed-Size'] = str(compressed_size)
+            response.headers['X-Compression-Ratio'] = f'{compression_ratio:.2f}'
+            
             return response
         except Exception as e:
-            return jsonify({'error': f'Error compressing PDF: {e}'}), 500
+            return jsonify({'error': f'Error compressing PDF: {str(e)}'}), 500
+        finally:
+            if temp_in_name and os.path.exists(temp_in_name):
+                os.unlink(temp_in_name)
+            if temp_out_name and os.path.exists(temp_out_name):
+                os.unlink(temp_out_name)
     else:
         return jsonify({'error': 'Unsupported file type for compression'}), 400
 

@@ -188,8 +188,11 @@ def compress_file():
             reader = PdfReader(temp_in_name)
             writer = PdfWriter()
             for page in reader.pages:
-                page.compress_content_streams()
                 writer.add_page(page)
+            
+            # Compress content streams after pages are added to writer
+            for page in writer.pages:
+                page.compress_content_streams()
 
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_out:
                 temp_out_name = temp_out.name

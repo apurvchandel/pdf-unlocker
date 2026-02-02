@@ -155,56 +155,89 @@ def compress_file():
             file.stream.seek(0)
             
             image = Image.open(file.stream)
-            # Convert to RGB to handle PNG transparency if saving as JPEG
-            if image.mode in ('RGBA', 'P') and file_extension in ['jpeg', 'jpg']:
+            # Convert to RGB to handle PNG transparency and allow JPEG conversion
+            if image.mode in ('RGBA', 'P'):
                 image = image.convert('RGB')
                 
             img_byte_arr = io.BytesIO()
             final_quality = quality
             
             if target_size:
-                # Binary search for best quality
+                # If target size is larger than original, return original (unless force compression desired? typically no)
+                # But user might want to optimize anyway. Let's try to meet target.
+                
+                # First pass: Try Quality Adjustment with Binary Search (1-95)
+                # We prioritize JPEG for target size constraint as it scales better
+                save_format = 'JPEG' 
+                
                 low = 1
                 high = 95
                 best_quality = 1
                 best_data = None
                 
-                # Perform binary search
                 while low <= high:
                     mid = (low + high) // 2
                     temp_buffer = io.BytesIO()
-                    # Determine format - mostly JPEG allows quality control
-                    save_format = 'JPEG' if file_extension in ['jpg', 'jpeg'] else 'PNG'
-                    
-                    if save_format == 'PNG':
-                         # PNG compression is different, usually just 'optimize=True'
-                         # We'll use JPEG logic for now if user wants target size on images where meaningful
-                         image.save(temp_buffer, format=save_format, optimize=True)
-                         # PNG doesn't support quality param in verify same way, so break loop
-                         best_data = temp_buffer.getvalue()
-                         break
-                    else:
-                        image.save(temp_buffer, format=save_format, quality=mid)
-                    
+                    image.save(temp_buffer, format=save_format, quality=mid)
                     size = len(temp_buffer.getvalue())
                     
                     if size <= target_size:
                         best_quality = mid
                         best_data = temp_buffer.getvalue()
-                        low = mid + 1 # Try better quality
+                        low = mid + 1 
                     else:
                         high = mid - 1
                 
-                # If we couldn't satisfy target size (even at quality 1), use quality 1
-                if best_data is None:
-                     temp_buffer = io.BytesIO()
-                     image.save(temp_buffer, format='JPEG', quality=1)
-                     best_data = temp_buffer.getvalue()
+                # Logic: If we found a quality that works, great.
+                # If not (best_data is None), it means even quality=1 is too big.
+                # In that case, we must RESIZE.
                 
-                img_byte_arr.write(best_data)
-                final_quality = best_quality
+                if best_data is None:
+                    # Start resizing loop
+                    resize_factor = 0.9
+                    current_image = image
+                    while True:
+                        # Resize
+                        width, height = current_image.size
+                        new_width = int(width * resize_factor)
+                        new_height = int(height * resize_factor)
+                        
+                        # Stop if too small
+                        if new_width < 10 or new_height < 10:
+                            break
+                            
+                        current_image = current_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        
+                        # Try saving at lowest quality to see if it fits
+                        temp_buffer = io.BytesIO()
+                        current_image.save(temp_buffer, format=save_format, quality=1) # Try aggressively first? Or 50?
+                        # Let's try quality 50 for a balance, if that fails we loop again. 
+                        # Actually to guarantee fit, checking lowest quality is safer check, 
+                        # but we want best possible quality.
+                        # Let's try saving at low quality (e.g. 5) to see if we are under limit.
+                        
+                        temp_buffer = io.BytesIO()
+                        current_image.save(temp_buffer, format=save_format, quality=5)
+                        
+                        if len(temp_buffer.getvalue()) <= target_size:
+                            # It fits! Now try to optimize quality for this size
+                            # Binary search again for this size? Or just return this?
+                            # For speed, let's just return this or try one improved quality pass
+                            img_byte_arr.write(temp_buffer.getvalue())
+                            break
+                        
+                        # If still too big, continue loop (resize more)
+                        resize_factor = 0.9 # Keep reducing by 10% of current
+                        
+                        # Safety break for infinite loops
+                        if new_width < 50:
+                            img_byte_arr.write(temp_buffer.getvalue())
+                            break
+                else:
+                    img_byte_arr.write(best_data)
+                    
             else:
-                # Standard quality compression
+                # Standard quality compression without target size
                 save_format = 'JPEG' if file_extension in ['jpg', 'jpeg'] else file_extension.upper()
                 if save_format == 'JPG': save_format = 'JPEG'
                 
@@ -221,11 +254,14 @@ def compress_file():
             # Calculate compression ratio
             compression_ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
             
+            # Output filename extension
+            out_extension = 'jpg' if target_size else file_extension
+            
             response = send_file(
                 img_byte_arr,
-                mimetype=f'image/{file_extension}' if file_extension != 'jpg' else 'image/jpeg',
+                mimetype='image/jpeg' if out_extension in ['jpg', 'jpeg'] else f'image/{out_extension}',
                 as_attachment=True,
-                download_name=f'compressed_image.{file_extension}'
+                download_name=f'compressed_image.{out_extension}'
             )
             
             # Add custom headers with file size information

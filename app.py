@@ -7,7 +7,8 @@ import tempfile
 import os
 
 app = Flask(__name__)
-CORS(app)
+# CRITICAL: Expose custom headers so JavaScript can read them
+CORS(app, expose_headers=['X-Original-Size', 'X-Compressed-Size', 'X-Compression-Ratio'])
 
 @app.route('/unlock', methods=['POST'])
 def unlock_pdf():
@@ -132,9 +133,15 @@ def compress_file():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     file = request.files['file']
-    quality = int(request.form.get('quality', 75)) # Default quality for images
+    
+    # Get parameters
+    target_size_str = request.form.get('target_size') # Optional, in bytes
+    quality_str = request.form.get('quality') # Optional, default 75
+    
+    target_size = int(target_size_str) if target_size_str and target_size_str.isdigit() else None
+    quality = int(quality_str) if quality_str and quality_str.isdigit() else 75
 
-    if not (1 <= quality <= 95):
+    if not target_size and not (1 <= quality <= 95):
         return jsonify({'error': 'Quality must be between 1 and 95'}), 400
 
     file_extension = file.filename.rsplit('.', 1)[1].lower()
@@ -148,8 +155,64 @@ def compress_file():
             file.stream.seek(0)
             
             image = Image.open(file.stream)
+            # Convert to RGB to handle PNG transparency if saving as JPEG
+            if image.mode in ('RGBA', 'P') and file_extension in ['jpeg', 'jpg']:
+                image = image.convert('RGB')
+                
             img_byte_arr = io.BytesIO()
-            image.save(img_byte_arr, format='JPEG', quality=quality)
+            final_quality = quality
+            
+            if target_size:
+                # Binary search for best quality
+                low = 1
+                high = 95
+                best_quality = 1
+                best_data = None
+                
+                # Perform binary search
+                while low <= high:
+                    mid = (low + high) // 2
+                    temp_buffer = io.BytesIO()
+                    # Determine format - mostly JPEG allows quality control
+                    save_format = 'JPEG' if file_extension in ['jpg', 'jpeg'] else 'PNG'
+                    
+                    if save_format == 'PNG':
+                         # PNG compression is different, usually just 'optimize=True'
+                         # We'll use JPEG logic for now if user wants target size on images where meaningful
+                         image.save(temp_buffer, format=save_format, optimize=True)
+                         # PNG doesn't support quality param in verify same way, so break loop
+                         best_data = temp_buffer.getvalue()
+                         break
+                    else:
+                        image.save(temp_buffer, format=save_format, quality=mid)
+                    
+                    size = len(temp_buffer.getvalue())
+                    
+                    if size <= target_size:
+                        best_quality = mid
+                        best_data = temp_buffer.getvalue()
+                        low = mid + 1 # Try better quality
+                    else:
+                        high = mid - 1
+                
+                # If we couldn't satisfy target size (even at quality 1), use quality 1
+                if best_data is None:
+                     temp_buffer = io.BytesIO()
+                     image.save(temp_buffer, format='JPEG', quality=1)
+                     best_data = temp_buffer.getvalue()
+                
+                img_byte_arr.write(best_data)
+                final_quality = best_quality
+            else:
+                # Standard quality compression
+                save_format = 'JPEG' if file_extension in ['jpg', 'jpeg'] else file_extension.upper()
+                if save_format == 'JPG': save_format = 'JPEG'
+                
+                if save_format == 'JPEG':
+                    image.save(img_byte_arr, format=save_format, quality=quality)
+                else:
+                    image.save(img_byte_arr, format=save_format, optimize=True)
+            
             img_byte_arr.seek(0)
             
             # Get compressed size
@@ -160,7 +223,7 @@ def compress_file():
             
             response = send_file(
                 img_byte_arr,
-                mimetype='image/jpeg',
+                mimetype=f'image/{file_extension}' if file_extension != 'jpg' else 'image/jpeg',
                 as_attachment=True,
                 download_name=f'compressed_image.{file_extension}'
             )
@@ -173,6 +236,7 @@ def compress_file():
             return response
         except Exception as e:
             return jsonify({'error': f'Error compressing image: {str(e)}'}), 500
+            
     elif file_extension == 'pdf':
         temp_in_name = None
         temp_out_name = None
@@ -187,10 +251,11 @@ def compress_file():
 
             reader = PdfReader(temp_in_name)
             writer = PdfWriter()
+            # Add pages first
             for page in reader.pages:
                 writer.add_page(page)
             
-            # Compress content streams after pages are added to writer
+            # Then compress
             for page in writer.pages:
                 page.compress_content_streams()
 
@@ -205,7 +270,7 @@ def compress_file():
             # Calculate compression ratio
             compression_ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
             
-            # Read the compressed file into memory to send with custom headers
+            # Read the compressed file into memory
             with open(temp_out_name, 'rb') as f:
                 pdf_data = io.BytesIO(f.read())
             
@@ -216,7 +281,7 @@ def compress_file():
                 download_name='compressed.pdf'
             )
             
-            # Add custom headers with file size information
+            # Add custom headers
             response.headers['X-Original-Size'] = str(original_size)
             response.headers['X-Compressed-Size'] = str(compressed_size)
             response.headers['X-Compression-Ratio'] = f'{compression_ratio:.2f}'
